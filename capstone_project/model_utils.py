@@ -1,0 +1,269 @@
+"""
+Utilità per caricamento modello MLflow e predizioni
+"""
+import mlflow
+import mlflow.sklearn
+import numpy as np
+import pandas as pd
+import json
+import joblib
+from pathlib import Path
+from typing import Dict, Tuple, List, Optional
+import config
+
+
+def setup_mlflow() -> None:
+    """Configura MLflow tracking URI"""
+    mlflow.set_tracking_uri(config.MLFLOW_TRACKING_URI)
+
+
+def load_registry_model_from_local_mlruns():
+    """
+    Carica il modello registrato cercando gli artefatti nella cartella mlruns locale.
+
+    MLflow salva path assoluti nei metadati (es. file:///Users/<utente>/...): se la cartella
+    mlruns arriva da un'altra macchina (clone GitHub, Streamlit Cloud) quei path non esistono.
+    I metadati del registry restano validi, quindi si risale al modello e lo si cerca qui.
+    """
+    mlruns_dir = config.BASE_DIR / "mlruns"
+    client = mlflow.MlflowClient()
+    version = client.get_model_version_by_alias(config.MLFLOW_MODEL_NAME, config.MLFLOW_MODEL_ALIAS)
+
+    candidates = []
+    # MLflow 3: source = "models:/<model_id>" -> mlruns/<exp>/models/<model_id>/artifacts
+    model_id = getattr(version, "model_id", None) or str(version.source).removeprefix("models:/")
+    if model_id:
+        candidates += list(mlruns_dir.glob(f"*/models/{model_id}/artifacts"))
+    # MLflow 2: modello salvato tra gli artefatti della run -> mlruns/<exp>/<run_id>/artifacts/model
+    if version.run_id:
+        candidates += list(mlruns_dir.glob(f"*/{version.run_id}/artifacts/model"))
+
+    for path in candidates:
+        if (path / "MLmodel").exists():
+            return mlflow.sklearn.load_model(str(path))
+    raise FileNotFoundError(f"Artefatti del modello non trovati in {mlruns_dir}")
+
+
+def load_model_from_mlflow():
+    """
+    Carica il modello con strategia a fallback:
+    1. Prova dal MLflow Registry (nome e alias dal config)
+    2. Se fallisce, cerca cartella 'model' nella working directory
+    
+    Legge dinamicamente le feature dal modello caricato.
+    
+    Returns:
+        tuple: (model, run_info_dict, feature_names)
+    """
+    # TENTATIVO 1: MLflow Registry
+    try:
+        setup_mlflow()
+        
+        # Costruisci URI del modello dal registry
+        model_uri = f"models:/{config.MLFLOW_MODEL_NAME}@{config.MLFLOW_MODEL_ALIAS}"
+        
+        # Carica il modello dal registry
+        try:
+            model = mlflow.sklearn.load_model(model_uri)
+            source = "MLflow Registry"
+        except Exception:
+            # mlruns copiata da un'altra macchina: path assoluti non validi
+            model = load_registry_model_from_local_mlruns()
+            source = "MLflow Registry (mlruns locale)"
+        
+        # Estrai feature names DIRETTAMENTE dal modello caricato
+        feature_names = extract_feature_names_from_model(model)
+        
+        # Ottieni informazioni sulla versione del modello
+        client = mlflow.MlflowClient()
+        try:
+            # Cerca la versione con l'alias specificato
+            model_versions = client.get_model_version_by_alias(
+                config.MLFLOW_MODEL_NAME, 
+                config.MLFLOW_MODEL_ALIAS
+            )
+            run_id = model_versions.run_id
+            version = model_versions.version
+            
+            # Cerca il run per ottenere le metriche
+            run = client.get_run(run_id)
+            
+            run_info = {
+                "run_id": run_id,
+                "run_name": run.data.tags.get("mlflow.runName", "N/A"),
+                "model_name": config.MLFLOW_MODEL_NAME,
+                "model_version": version,
+                "model_alias": config.MLFLOW_MODEL_ALIAS,
+                "source": source,
+                "accuracy": run.data.metrics.get("accuracy", 0.0),
+                "precision": run.data.metrics.get("precision", 0.0),
+                "recall": run.data.metrics.get("recall", 0.0),
+                "f1_score": run.data.metrics.get("f1_score", 0.0),
+                "roc_auc": run.data.metrics.get("roc_auc", 0.0)
+            }
+        except Exception:
+            # Fallback info se non riesce a ottenere dal registry
+            run_info = {
+                "run_id": "N/A",
+                "run_name": "N/A",
+                "model_name": config.MLFLOW_MODEL_NAME,
+                "model_version": "N/A",
+                "model_alias": config.MLFLOW_MODEL_ALIAS,
+                "source": source,
+                "accuracy": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1_score": 0.0,
+                "roc_auc": 0.0
+            }
+        
+        return model, run_info, feature_names
+        
+    except Exception as e:
+        # TENTATIVO 2: Cartella locale 'model'
+        print(f"⚠️ MLflow Registry non disponibile: {e}")
+        print("🔍 Cercando modello nella cartella locale 'model'...")
+        
+        try:
+            # Cerca cartella model nella working directory
+            model_dir = Path(__file__).parent / "model"
+            
+            if not model_dir.exists():
+                raise FileNotFoundError(f"Cartella 'model' non trovata in {model_dir.parent}")
+            
+            # Cerca file del modello (prova diversi formati)
+            model_file = None
+            for pattern in ["model.pkl", "model.joblib", "*.pkl", "*.joblib"]:
+                matches = list(model_dir.glob(pattern))
+                if matches:
+                    model_file = matches[0]
+                    break
+            
+            if not model_file:
+                raise FileNotFoundError(f"Nessun file modello trovato in {model_dir}")
+            
+            print(f"✓ Trovato modello: {model_file.name}")
+            
+            # Carica il modello
+            model = joblib.load(model_file)
+            
+            # Estrai feature names
+            feature_names = extract_feature_names_from_model(model)
+            
+            # Info minimali per il modello locale
+            run_info = {
+                "run_id": "local",
+                "run_name": model_file.stem,
+                "model_name": "model",
+                "model_version": "local",
+                "model_alias": "local",
+                "source": f"Local File ({model_file.name})",
+                "accuracy": 0.0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "f1_score": 0.0,
+                "roc_auc": 0.0
+            }
+            
+            return model, run_info, feature_names
+            
+        except Exception as e2:
+            raise RuntimeError(
+                f"Impossibile caricare il modello né da MLflow Registry né da cartella locale.\n"
+                f"Errore MLflow: {e}\n"
+                f"Errore locale: {e2}"
+            )
+
+
+def extract_feature_names_from_model(model) -> List[str]:
+    """
+    Estrae DINAMICAMENTE i nomi delle feature dal modello caricato.
+    Questo determina quale sottoinsieme di feature mostrare nell'interfaccia.
+    
+    Args:
+        model: Pipeline sklearn caricata da MLflow
+        
+    Returns:
+        list: Lista di nomi delle features richieste dal modello
+    """
+    # Metodo 1: Usa feature_names_in_ (sklearn >= 1.0)
+    if hasattr(model, 'feature_names_in_'):
+        return list(model.feature_names_in_)
+    
+    # Metodo 2: Se è una Pipeline, prova il primo step
+    if hasattr(model, 'steps'):
+        first_step = model.steps[0][1]
+        if hasattr(first_step, 'feature_names_in_'):
+            return list(first_step.feature_names_in_)
+    
+    # Metodo 3: Prova con n_features_in_ e genera nomi generici
+    if hasattr(model, 'n_features_in_'):
+        n_features = model.n_features_in_
+        # Usa le prime n_features dal config in ordine
+        all_features = list(config.FEATURE_RANGES.keys())
+        return all_features[:n_features]
+    
+    # Fallback: usa tutte le feature dal config
+    return list(config.FEATURE_RANGES.keys())
+
+
+def predict_wine_quality(model, features: Dict[str, float]) -> Tuple[int, float]:
+    """
+    Effettua predizione sulla qualità del vino.
+    
+    Args:
+        model: Modello MLflow caricato
+        features: Dizionario con valori delle features
+        
+    Returns:
+        tuple: (classe_predetta, probabilità_alta_qualità)
+    """
+    # Crea DataFrame con le features, nello stesso ordine usato in training
+    df = pd.DataFrame([features])
+    df = df[extract_feature_names_from_model(model)]
+    
+    # Predizione
+    prediction = model.predict(df)[0]
+    probability = model.predict_proba(df)[0, 1]  # Probabilità classe positiva (alta qualità)
+    
+    return int(prediction), float(probability)
+
+
+def get_quality_level(probability: float) -> str:
+    """
+    Restituisce la chiave del livello di qualità (vedi config.QUALITY_LEVELS).
+    
+    Args:
+        probability: Probabilità di alta qualità (0-1)
+        
+    Returns:
+        str: "excellent", "good", "medium" oppure "low"
+    """
+    for level in ["excellent", "good", "medium"]:
+        if probability >= config.QUALITY_THRESHOLDS[level]:
+            return level
+    return "low"
+
+
+def get_feature_importance(model) -> Optional[pd.Series]:
+    """
+    Importanza delle feature secondo il modello, normalizzata a somma 1.
+    
+    Usa feature_importances_ (alberi, foreste, boosting) oppure il valore assoluto
+    di coef_ (modelli lineari) dell'ultimo step della pipeline.
+    
+    Returns:
+        pd.Series indicizzata per feature, oppure None se il modello non la espone
+    """
+    estimator = model.steps[-1][1] if hasattr(model, "steps") else model
+    if hasattr(estimator, "feature_importances_"):
+        values = np.asarray(estimator.feature_importances_, dtype=float)
+    elif hasattr(estimator, "coef_"):
+        values = np.abs(np.asarray(estimator.coef_, dtype=float)).reshape(-1)
+    else:
+        return None
+    
+    feature_names = extract_feature_names_from_model(model)
+    if len(values) != len(feature_names) or values.sum() == 0:
+        return None
+    return pd.Series(values / values.sum(), index=feature_names).sort_values(ascending=False)
